@@ -13,6 +13,8 @@ import asyncio
 from datetime import datetime
 from tornado.ioloop import IOLoop
 from zipfile import ZipFile
+import urllib.request
+import urllib.parse
 
 # Annotation imports
 from typing import (
@@ -60,17 +62,13 @@ class Timelapse:
             "output_path", "~/timelapse/")
         temp_dir_cfg = confighelper.get(
             "frame_path", "/tmp/timelapse/")
-        self.ffmpeg_binary_path = confighelper.get(
-            "ffmpeg_binary_path", "/usr/bin/ffmpeg")
-        self.wget_skip_cert = confighelper.getboolean(
-            "wget_skip_cert_check", False)
 
         # Setup default config
         self.config: Dict[str, Any] = {
             'enabled': True,
             'mode': "layermacro",
             'camera': "",
-            'snapshoturl': "http://localhost:8080/?action=snapshot",
+            'snapshoturl': "http://127.0.0.1:8889/snapshot",
             'stream_delay_compensation': 0.05,
             'gcode_verbose': False,
             'parkhead': False,
@@ -117,13 +115,6 @@ class Timelapse:
         # this is a fallback to older setups and when the Frontend doesn't
         # support the settings endpoint
         self.overwriteDbconfigWithConfighelper()
-
-        # check if ffmpeg is installed
-        self.ffmpeg_installed = os.path.isfile(self.ffmpeg_binary_path)
-        if not self.ffmpeg_installed:
-            self.config['autorender'] = False
-            logging.info(f"timelapse: {self.ffmpeg_binary_path} \
-                        not found please install to use render functionality")
 
         # setup directories
         # remove trailing "/"
@@ -464,23 +455,16 @@ class Timelapse:
         # make sure webcamconfig is uptodate before grabbing a new frame
         await self.getWebcamConfig()
 
-        options = ""
-        if self.wget_skip_cert:
-            options += "--no-check-certificate "
-
         self.framecount += 1
         framefile = "frame" + str(self.framecount).zfill(6) + ".jpg"
-        cmd = "wget " + options + self.config['snapshoturl'] \
-              + " -O " + self.temp_dir + framefile
         self.lastframefile = framefile
-        logging.debug(f"cmd: {cmd}")
+        logging.debug(f"download frame: {framefile}")
 
-        shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-        scmd = shell_cmd.build_shell_command(cmd, None)
+        cmdstatus = None
         try:
-            cmdstatus = await scmd.run(timeout=2., verbose=False)
+            cmdstatus = urllib.request.urlretrieve(self.config['snapshoturl'], self.temp_dir + framefile)
         except Exception:
-            logging.exception(f"Error running cmd '{cmd}'")
+            logging.exception(f"Error downloading '{framefile}'")
 
         result = {'action': 'newframe'}
         if cmdstatus:
@@ -490,7 +474,7 @@ class Timelapse:
                 'status': 'success'
             })
         else:
-            logging.info(f"getting newframe failed: {cmd}")
+            logging.info(f"getting newframe failed: {framefile}")
             self.framecount -= 1
             result.update({'status': 'error'})
 
@@ -609,11 +593,6 @@ class Timelapse:
         elif self.renderisrunning:
             msg = "render is already running"
             status = "running"
-        elif not self.ffmpeg_installed:
-            msg = f"{self.ffmpeg_binary_path} not found, please install ffmpeg"
-            status = "error"
-            # cmd = outfile = None
-            logging.info(f"timelapse: {msg}")
         else:
             self.renderisrunning = True
 
@@ -681,13 +660,12 @@ class Timelapse:
                 filterParam = " -vf 'vflip'"
 
             # build shell command
-            cmd = self.ffmpeg_binary_path \
-                + " -r " + str(fps) \
+            cmd = " -r " + str(fps) \
                 + " -i '" + inputfiles + "'" \
                 + filterParam \
                 + " -threads 2 -g 5" \
                 + " -crf " + str(self.config['constant_rate_factor']) \
-                + " -vcodec libx264" \
+                + " -vcodec h264_mediacodec" \
                 + " -pix_fmt " + self.config['pixelformat'] \
                 + " -an" \
                 + " " + self.config['extraoutputparams'] \
@@ -706,16 +684,13 @@ class Timelapse:
             })
 
             # run the command
-            shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
             self.notify_event(result)
-            scmd = shell_cmd.build_shell_command(cmd, self.ffmpeg_cb)
             try:
-                cmdstatus = await scmd.run(verbose=True,
-                                           log_complete=False,
-                                           timeout=9999999999,
-                                           )
+                with urllib.request.urlopen('http://127.0.0.1:8888/beam/ffmpeg?cmd=' + urllib.parse.quote_plus(cmd)) as f:
+                    cmdstatus = f.read()
+                    self.ffmpeg_cb(cmdstatus)
             except Exception:
-                logging.exception(f"Error running cmd '{cmd}'")
+                logging.exception(f"Error running ffmpeg '{cmd}'")
 
             # check success
             if cmdstatus:
@@ -751,8 +726,7 @@ class Timelapse:
 
                     # apply rotation previewimage if needed
                     if filterParam or self.config['extraoutputparams']:
-                        cmd = self.ffmpeg_binary_path \
-                            + " -i '" + previewFilePath + "'" \
+                        cmd = " -i '" + previewFilePath + "'" \
                             + filterParam \
                             + " -an" \
                             + " " + self.config['extraoutputparams'] \
@@ -760,14 +734,12 @@ class Timelapse:
 
                         logging.info(f"Rotate preview image cmd: {cmd}")
 
-                        scmd = shell_cmd.build_shell_command(cmd)
                         try:
-                            cmdstatus = await scmd.run(verbose=True,
-                                                       log_complete=False,
-                                                       timeout=9999999999,
-                                                       )
+                            with urllib.request.urlopen('http://127.0.0.1:8888/beam/ffmpeg?cmd=' + urllib.parse.quote_plus(cmd)) as f:
+                                cmdstatus = f.read()
+                                self.ffmpeg_cb(cmdstatus)
                         except Exception:
-                            logging.exception(f"Error running cmd '{cmd}'")
+                            logging.exception(f"Error running ffmpeg '{cmd}'")
 
             else:
                 status = "error"
